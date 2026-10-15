@@ -9,145 +9,324 @@ works, but nobody has reviewed it. Read PROBLEM_STATEMENT.docx for what is expec
 openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
 import os
-from datetime import datetime, timedelta, timezone
-from typing import Optional
-
+import re
+from datetime import datetime, timedelta, timezone, date as dt_date, time as dt_time
+from bson.codec_options import CodecOptions
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from pymongo import MongoClient
+from fastapi import FastAPI, HTTPException, Path, Query
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_validator
+from pymongo import ASCENDING, DESCENDING, IndexModel, MongoClient, ReturnDocument
+from pymongo.errors import DuplicateKeyError
+from typing import Annotated, Any, Dict, List, Literal, Optional
 
 load_dotenv()
 
 client = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017"))
-db = client[os.getenv("MONGO_DB", "attendance_db")]
+db = client[os.getenv("MONGO_DB", "attendance_db")].with_options(
+    codec_options=CodecOptions(tz_aware=True, tzinfo=timezone.utc)
+)
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
 app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0")
 
 
+# Reject booleans, floats, strings, and out-of-range/second-looking numbers.
+def validate_epoch_millis(v: Any) -> int:
+    if type(v) is not int:
+        raise ValueError("Instant must be a strict integer in epoch milliseconds")
+    if v < MIN_EPOCH_MS or v > MAX_EPOCH_MS:
+        raise ValueError(
+            f"Instant must be between {MIN_EPOCH_MS} and {MAX_EPOCH_MS} ms"
+        )
+    return v
+
+def validate_date_str(v: Any) -> str:
+    if not isinstance(v, str) or not DATE_REGEX.match(v):
+        raise ValueError("Date must be a string in YYYY-MM-DD format")
+    try:
+        dt_date.fromisoformat(v)
+    except ValueError as exc:
+        raise ValueError("Invalid calendar date") from exc
+    return v
+
+# --------------------------------------------------------------------------- #
+# Validations & Literals
+# --------------------------------------------------------------------------- #
+DATE_REGEX = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+MONTH_REGEX = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
+SHIFT_REGEX = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+EMP_CODE_REGEX = re.compile(r"^EMP\d{4,6}$")
+EMAIL_REGEX = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+StatusLiteral = Literal["PRESENT", "ABSENT", "LEAVE", "WFH", "ON_DUTY"]
+PresenceStatusLiteral = Literal["PRESENT", "WFH", "ON_DUTY"]
+
+Tuple_Year_Month = tuple[int, int]
+EpochMillis = Annotated[int, BeforeValidator(validate_epoch_millis)]
+DateStr = Annotated[str, BeforeValidator(validate_date_str)]
+
+MIN_EPOCH_MS = 100_000_000_000
+MAX_EPOCH_MS = 4_102_444_800_000
+
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
-def compute_late_minutes(punch_in: datetime, shift_start: str) -> int:
-    h, m = map(int, shift_start.split(":"))
-    start = punch_in.replace(hour=h, minute=m, second=0, microsecond=0)
-    minutes = int((punch_in - start).total_seconds() / 60)
-    return minutes if minutes > 10 else 0
+
+# Truncates the milliseconds from a datetime object. 
+# If dt is None, returns the current UTC time with milliseconds truncated.
+def utc_truncate_milliseconds(dt: datetime | None):
+    if not dt:
+        return datetime.now(timezone.utc).replace(microsecond=0)
+    return dt.replace(microsecond=0)
+
+# Converts milliseconds since epoch to a UTC datetime object.
+def ms_to_utc_dt(ms: int):
+    truncated_sec = ms // 1000
+    return datetime.fromtimestamp(truncated_sec, tz=timezone.utc)
+
+def parse_hhmm(hhmm: str):
+    h, m = map(int, hhmm.split(":"))
+    return dt_time(hour=h, minute=m, second=0)
+
+# Determine the IST attendance date for a punch_in instant (R1).
+# For overnight shifts, a punch-in earlier than shift_end in IST belongs
+# to the shift that started the previous calendar day.
+def get_attendance_date(punch_in_utc: datetime, shift_start: str, shift_end: str):
+    ist_dt = punch_in_utc.astimezone(IST)
+    att_date = ist_dt.date()
+    if shift_end <= shift_start:
+        if ist_dt.time() < parse_hhmm(shift_end):
+            att_date = att_date - timedelta(days=1)
+    return att_date.isoformat()
+
+def build_shift_bounds(att_date_str: str, shift_start: str, shift_end: str):
+    base_date = dt_date.fromisoformat(att_date_str)
+    start_t = parse_hhmm(shift_start)
+    end_t = parse_hhmm(shift_end)
+
+    start_ist = datetime.combine(base_date, start_t, tzinfo=IST)
+    end_date = (
+        base_date + timedelta(days=1)
+        if shift_end <= shift_start
+        else base_date
+    )
+    end_ist = datetime.combine(end_date, end_t, tzinfo=IST)
+    return start_ist.astimezone(timezone.utc), end_ist.astimezone(timezone.utc)
+
+# Rule R2: 10-minute grace period (600s).
+# Strictly more than 10:00 after shift_start -> floor minutes since shift_start.
+def compute_late_minutes(punch_in_utc: datetime, shift_start: str, shift_end: str, att_date_str: str) -> int:
+    shift_start_utc, _ = build_shift_bounds(att_date_str, shift_start, shift_end)
+    diff_seconds = (punch_in_utc - shift_start_utc).total_seconds()
+    if diff_seconds > 600:
+        return int(diff_seconds // 60)
+    return 0
 
 
 def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
     return round((punch_out - punch_in).total_seconds() / 3600, 2)
 
+# Whole minutes (floor) from shift_end to punch_out if >= 30, else 0.
+def compute_overtime(punch_out_utc: datetime, shift_start: str, shift_end: str, att_date_str: str) -> int:
+    _, shift_end_utc = build_shift_bounds(att_date_str, shift_start, shift_end)
+    diff_seconds = (punch_out_utc - shift_end_utc).total_seconds()
+    minutes = int(diff_seconds // 60)
 
-def compute_overtime(punch_out: datetime, shift_end: str, date_str: str) -> int:
-    h, m = map(int, shift_end.split(":"))
-    end = datetime.fromisoformat(date_str).replace(hour=h, minute=m, tzinfo=IST)
-    return max(0, int((punch_out - end).total_seconds() / 60))
+    return minutes if minutes >= 30 else 0
+
+def parse_date_param(v: str, param_name: str = "date"):
+    if not isinstance(v, str) or not DATE_REGEX.match(v):
+        raise HTTPException(status_code=422, detail=f"Invalid {param_name} format")
+    try:
+        return dt_date.fromisoformat(v)
+    except ValueError:
+        raise HTTPException(status_code=422, detail=f"Invalid calendar {param_name}")
 
 
 # --------------------------------------------------------------------------- #
-# Models
+# Models with base validation
 # --------------------------------------------------------------------------- #
-class EmployeeIn(BaseModel):
-    emp_code: str
-    name: str
-    email: str
-    department: str
-    shift_start: str = "09:30"
-    shift_end: str = "18:30"
-    joined_on: str
+class EmployeeCreate(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    emp_code: str = Field(..., pattern=r"^EMP\d{4,6}$")
+    name: str = Field(..., min_length=1, max_length=100)
+    email: str = Field(..., max_length=120, pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+    department: str = Field(..., min_length=1, max_length=50)
+    shift_start: str = Field("09:30", pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
+    shift_end: str = Field("18:30", pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
+    joined_on: DateStr
+
+    @model_validator(mode="after")
+    def check_shifts_differ(self) -> "EmployeeCreate":
+        if self.shift_start == self.shift_end:
+            raise ValueError("shift_start must differ from shift_end")
+        return self
 
 
-class PunchInIn(BaseModel):
-    emp_code: str
-    punched_at: Optional[int] = None
-    status: str = "PRESENT"
+class PunchInRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
 
+    emp_code: str = Field(..., min_length=1)
+    punched_at: Optional[EpochMillis] = None
+    status: PresenceStatusLiteral = "PRESENT"
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_non_null_defaults(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            if "status" in data and data["status"] is None:
+                raise ValueError("status cannot be null")
+        return data
+
+
+class PunchOutRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    emp_code: str = Field(..., min_length=1)
+    punched_at: Optional[EpochMillis] = None
+
+
+class RegularizeRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    status: Optional[StatusLiteral] = None
+    punch_in: Optional[EpochMillis] = None
+    punch_out: Optional[EpochMillis] = None
+    reason: str = Field(..., min_length=5, max_length=200)
+    regularized_by: str = Field(..., min_length=1, max_length=50)
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_explicit_nulls(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            for key in ("status", "punch_in", "punch_out"):
+                if key in data and data[key] is None:
+                    raise ValueError(f"{key} cannot be explicitly null")
+        return data
 
 # --------------------------------------------------------------------------- #
 # Endpoints provided
 # --------------------------------------------------------------------------- #
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    try:
+        client.admin.command("ping")
+        return {"status": "ok"}
+    except Exception as e:
+        raise HTTPException(503, f"MongoDB connection failed: {e}")
 
 
 @app.post("/employees", status_code=201)
-def create_employee(body: EmployeeIn):
-    if db.employees.find_one({"emp_code": body.emp_code}):
-        raise HTTPException(409, "emp_code already exists")
+def create_employee(body: EmployeeCreate):
     doc = body.model_dump()
-    doc["created_at"] = datetime.now()
-    db.employees.insert_one(doc)
-    doc.pop("_id", None)
+    doc["created_at"] = utc_truncate_milliseconds(None)
+
+    try:
+        db.employees.insert_one(doc)
+        doc.pop("_id", None)
+    except DuplicateKeyError:
+        raise HTTPException(409, "emp_code already exists")
+
     return doc
 
 
 @app.get("/employees")
-def list_employees(department: Optional[str] = None, page: int = 1, page_size: int = 20):
+def list_employees(
+    department: str | None = None, 
+    page: int = Query(1, ge=1), 
+    page_size: int = Query(20, ge=1, le=100)
+):
     q = {}
-    if department:
+
+    if department is not None:
         q["department"] = department
-    skip = page * page_size
-    total = db.employees.count_documents({})
-    items = list(db.employees.find(q, {"_id": 0}).skip(skip).limit(page_size))
+
+    skip = (page - 1) * page_size
+    total = db.employees.count_documents(q)
+    items = list(
+        db.employees.find(q, {"_id": 0})
+        .sort("emp_code", ASCENDING)
+        .skip(skip)
+        .limit(page_size)
+    )
+
     return {"items": items, "total": total, "page": page, "page_size": page_size}
 
 
 @app.post("/attendance/punch-in", status_code=201)
-def punch_in(body: PunchInIn):
+def punch_in(body: PunchInRequest):
     emp = db.employees.find_one({"emp_code": body.emp_code})
-    ts = datetime.fromtimestamp(body.punched_at / 1000) if body.punched_at else datetime.now()
-    d = ts.date().isoformat()
-    if db.attendance_logs.find_one({"emp_code": body.emp_code, "date": d}):
-        raise HTTPException(409, "already punched in for this date")
+    if not emp:
+        raise HTTPException(404, "employee not found")
+
+    ts = ms_to_utc_dt(body.punched_at) if body.punched_at is not None else utc_truncate_milliseconds(None)
+    attendance_date = get_attendance_date(ts, emp["shift_start"], emp["shift_end"])
+    late_minutes = compute_late_minutes(ts, emp["shift_start"], emp["shift_end"], attendance_date)
+
     doc = {
         "emp_code": body.emp_code,
-        "date": d,
+        "date": attendance_date,
         "status": body.status,
         "punch_in": ts,
         "punch_out": None,
         "work_hours": None,
-        "late_minutes": compute_late_minutes(ts, emp["shift_start"]),
+        "late_minutes": late_minutes,
         "overtime_minutes": 0,
         "half_day": False,
         "history": [],
     }
-    res = db.attendance_logs.insert_one(doc)
-    doc["id"] = str(res.inserted_id)
-    doc.pop("_id", None)
+
+    try:
+        res = db.attendance_logs.insert_one(doc)
+        doc["id"] = str(res.inserted_id)
+        doc.pop("_id", None)
+    except DuplicateKeyError:
+        raise HTTPException(409, "Already punched in for this attendance date")
+
     return doc
 
 
 @app.get("/attendance")
 def list_attendance(
-    emp_code: Optional[str] = None,
-    date_from: Optional[str] = None,
-    date_to: Optional[str] = None,
-    status: Optional[str] = None,
-    page: int = 1,
-    page_size: int = 20,
+    emp_code: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    status: str | None = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
 ):
     q = {}
-    if emp_code:
+    if date_from is not None:
+        parse_date_param(date_from, "date_from")
+    if date_to is not None:
+        parse_date_param(date_to, "date_to")
+    if date_from is not None and date_to is not None and date_from > date_to:
+        raise HTTPException(422, "date_from cannot be after date_to")
+
+    if emp_code is not None:
         q["emp_code"] = emp_code
-    if date_from or date_to:
+    if date_from is not None or date_to is not None:
         q["date"] = {}
-        if date_from:
+        if date_from is not None:
             q["date"]["$gte"] = date_from
-        if date_to:
+        if date_to is not None:
             q["date"]["$lte"] = date_to
-    if status:
+    if status is not None:
         q["status"] = status
-    docs = list(db.attendance_logs.find(q))
-    docs.sort(key=lambda d: d["date"], reverse=True)
-    total = len(docs)
-    page_docs = docs[(page - 1) * page_size : page * page_size]
-    for d in page_docs:
-        d["id"] = str(d.pop("_id"))
-    return {"items": page_docs, "total": total, "page": page, "page_size": page_size}
+
+    skip = (page - 1) * page_size
+    total = db.attendance_logs.count_documents(q)
+    items = (
+        db.attendance_logs.find(q, {"_id": 0})
+        .sort([("date", DESCENDING), ("emp_code", ASCENDING)])
+        .skip(skip)
+        .limit(page_size)
+    )
+
+    return {"items": items, "total": total, "page": page, "page_size": page_size}
+
 
 
 # --------------------------------------------------------------------------- #

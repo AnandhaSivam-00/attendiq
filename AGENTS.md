@@ -27,11 +27,12 @@ py -3.12 -m venv .venv
 
 .venv\Scripts\activate  # if this command not works, try source .venv/Scripts/activate
 
-# Install
+# Installing the dependencies listed in requirements.txt
 pip install -r requirements.txt
 
 # Run
 uvicorn app.main:app --port 8000 --reload
+# For powershell, use .venv\Scripts\python.exe -m uvicorn app.main:app --port 8000 --reload
 ```
 
 Do not start the server unless the user asks. Do not deploy.
