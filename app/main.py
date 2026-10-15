@@ -10,8 +10,10 @@ openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
 import os
 import re
+import calendar
 from datetime import datetime, timedelta, timezone, date as dt_date, time as dt_time
 from bson.codec_options import CodecOptions
+from bson.decimal128 import Decimal128
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Path, Query
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_validator
@@ -129,7 +131,6 @@ def compute_late_minutes(punch_in_utc: datetime, shift_start: str, shift_end: st
         return int(diff_seconds // 60)
     return 0
 
-
 def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
     return round((punch_out - punch_in).total_seconds() / 3600, 2)
 
@@ -148,6 +149,41 @@ def parse_date_param(v: str, param_name: str = "date"):
         return dt_date.fromisoformat(v)
     except ValueError:
         raise HTTPException(status_code=422, detail=f"Invalid calendar {param_name}")
+
+# Rule R7: Mon-Fri in month, counted from joined_on for mid-month joiners.
+def compute_working_days_in_month(m_start: dt_date, m_end: dt_date, joined_on_str: str):
+    joined_dt = dt_date.fromisoformat(joined_on_str)
+
+    if joined_dt > m_end:
+        return 0
+
+    curr = max(m_start, joined_dt)
+    count = 0
+    while curr <= m_end:
+        if curr.weekday() < 5:
+            count += 1
+        curr += timedelta(days=1)
+    return count
+
+# Build a MongoDB aggregation expression that rounds a non-negative number
+# half-up using Decimal128 arithmetic: floor(val * 10^k + 0.5) / 10^k.
+def mongo_round_half_up(decimal_expr: Any, decimals: int):
+    factor = 10**decimals
+    return {
+        "$toDouble": {
+            "$divide": [
+                {
+                    "$floor": {
+                        "$add": [
+                            {"$multiply": [{"$toDecimal": decimal_expr}, factor]},
+                            Decimal128("0.5"),
+                        ]
+                    }
+                },
+                factor,
+            ]
+        }
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -413,4 +449,139 @@ def punch_out(body: PunchOutRequest):
         return_document=ReturnDocument.AFTER)
     if not updated_entry:
         raise HTTPException(409, "Record is already punched out")
+    return updated_entry
+
+
+@app.patch("/attendance/{emp_code}/{date}")
+def patch_attendance(emp_code: str, date: str, body: RegularizeRequest):
+    parse_date_param(date, "date")
+
+    emp_data = db.employees.find_one({ "emp_code": emp_code })
+    if not emp_data:
+        raise HTTPException(404, "Employee not found")
+
+    entry = db.attendance_logs.find_one({ 
+        "emp_code": emp_code, 
+        "date": date 
+    })
+    if not entry:
+        raise HTTPException(404, "Attendance record not found for this date")
+
+    old_status: str = entry.get("status")
+    old_punch_in: datetime | None = entry.get("punch_in")
+    if old_punch_in is not None and old_punch_in.tzinfo is None:
+        old_punch_in = old_punch_in.replace(tzinfo=timezone.utc)
+
+    old_punch_out: datetime | None = entry.get("punch_out")
+    if old_punch_out is not None and old_punch_out.tzinfo is None:
+        old_punch_out = old_punch_out.replace(tzinfo=timezone.utc)
+
+    old_work_hours: float | None = (
+        round_half_up(entry["work_hours"], 2)
+        if entry.get("work_hours") is not None
+        else None
+    )
+    old_late_minutes: int = int(entry.get("late_minutes") or 0)
+    old_overtime_minutes: int = int(entry.get("overtime_minutes") or 0)
+    old_half_day: bool = bool(entry.get("half_day", False))
+
+    new_status = body.status if body.status is not None else old_status
+
+    if new_status in ("ABSENT", "LEAVE"):
+        if body.punch_in is not None or body.punch_out is not None:
+            raise HTTPException(422, "Cannot supply punch_in or punch_out when status is ABSENT or LEAVE")
+        new_punch_in: datetime | None = None
+        new_punch_out: datetime | None = None
+        new_work_hours: float | None = None
+        new_late_minutes: int = 0
+        new_overtime_minutes: int = 0
+        new_half_day: bool = False
+    else:
+        new_punch_in = (
+            ms_to_utc_dt(body.punch_in)
+            if body.punch_in is not None
+            else old_punch_in
+        )
+        new_punch_out = (
+            ms_to_utc_dt(body.punch_out)
+            if body.punch_out is not None
+            else old_punch_out
+        )
+
+        if new_punch_in is None:
+            raise HTTPException(422, "A presence status requires punch_in")
+
+        expected_att_date = get_attendance_date(new_punch_in, emp_data["shift_start"], emp_data["shift_end"])
+        if expected_att_date != date:
+            raise HTTPException(422, "punch_in does not belong to the record's attendance date (R1)")
+
+        new_late_minutes = compute_late_minutes(new_punch_in, emp_data["shift_start"], emp_data["shift_end"], date)
+
+        if new_punch_out is not None:
+            elapsed = (new_punch_out - new_punch_in).total_seconds()
+            if elapsed <= 0 or elapsed > 24 * 60 * 60:
+                raise HTTPException(422, "punch_out must be after punch_in and within 24 hours")
+            new_work_hours = compute_work_hours(new_punch_in, new_punch_out)
+            new_overtime_minutes = compute_overtime(new_punch_out, emp_data["shift_start"], emp_data["shift_end"], date)
+            new_half_day = new_work_hours < 4.50
+        else:
+            new_work_hours = None
+            new_overtime_minutes = 0
+            new_half_day = False
+
+    comparisons = [
+        ("status", old_status, new_status),
+        ("punch_in", old_punch_in, new_punch_in),
+        ("punch_out", old_punch_out, new_punch_out),
+        ("work_hours", old_work_hours, new_work_hours),
+        ("late_minutes", old_late_minutes, new_late_minutes),
+        ("overtime_minutes", old_overtime_minutes, new_overtime_minutes),
+        ("half_day", old_half_day, new_half_day),
+    ]
+
+    changes: dict[str, dict[str, Any]] = {}
+    for field_name, old_val, new_val in comparisons:
+        if old_val != new_val:
+            changes[field_name] = {"from": old_val, "to": new_val}
+
+    if not changes:
+        raise HTTPException(422, "Regularization request changes nothing")
+
+    history_entry = {
+        "at": utc_truncate_milliseconds(None),
+        "by": body.regularized_by,
+        "reason": body.reason,
+        "changes": changes,
+    }
+
+    old_history_len = len(entry.get("history") or [])
+    updated_entry = db.attendance_logs.find_one_and_update({
+        "_id": entry["_id"],
+        "status": old_status,
+        "punch_in": entry.get("punch_in"),
+        "punch_out": entry.get("punch_out"),
+        "$expr": {
+            "$eq": [
+                {"$size": {"$ifNull": ["$history", []]}},
+                old_history_len,
+            ]
+        },
+    },
+        {
+            "$set": {
+                "status": new_status,
+                "punch_in": new_punch_in,
+                "punch_out": new_punch_out,
+                "work_hours": new_work_hours,
+                "late_minutes": new_late_minutes,
+                "overtime_minutes": new_overtime_minutes,
+                "half_day": new_half_day,
+            },
+            "$push": {"history": history_entry},
+    },
+        return_document=ReturnDocument.AFTER)
+
+    if not updated_entry:
+        raise HTTPException(409, "Concurrent modification detected; please retry")
+
     return updated_entry
