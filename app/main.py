@@ -17,7 +17,8 @@ from fastapi import FastAPI, HTTPException, Path, Query
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_validator
 from pymongo import ASCENDING, DESCENDING, IndexModel, MongoClient, ReturnDocument
 from pymongo.errors import DuplicateKeyError
-from typing import Annotated, Any, Dict, List, Literal, Optional
+from typing import Annotated, Any, Literal
+from decimal import Decimal, ROUND_HALF_UP
 
 load_dotenv()
 
@@ -88,6 +89,11 @@ def ms_to_utc_dt(ms: int):
 def parse_hhmm(hhmm: str):
     h, m = map(int, hhmm.split(":"))
     return dt_time(hour=h, minute=m, second=0)
+
+# Round half-up, avoiding Python's banker's rounding.
+def round_half_up(value: float | Decimal, decimals: int = 2):
+    q = Decimal("10") ** (-decimals)
+    return float(Decimal(str(value)).quantize(q, ROUND_HALF_UP))
 
 # Determine the IST attendance date for a punch_in instant (R1).
 # For overnight shifts, a punch-in earlier than shift_end in IST belongs
@@ -169,7 +175,7 @@ class PunchInRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     emp_code: str = Field(..., min_length=1)
-    punched_at: Optional[EpochMillis] = None
+    punched_at: EpochMillis | None = None
     status: PresenceStatusLiteral = "PRESENT"
 
     @model_validator(mode="before")
@@ -185,15 +191,15 @@ class PunchOutRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     emp_code: str = Field(..., min_length=1)
-    punched_at: Optional[EpochMillis] = None
+    punched_at: EpochMillis | None = None
 
 
 class RegularizeRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
-    status: Optional[StatusLiteral] = None
-    punch_in: Optional[EpochMillis] = None
-    punch_out: Optional[EpochMillis] = None
+    status: StatusLiteral | None = None
+    punch_in: EpochMillis | None = None
+    punch_out: EpochMillis | None = None
     reason: str = Field(..., min_length=5, max_length=200)
     regularized_by: str = Field(..., min_length=1, max_length=50)
 
@@ -339,3 +345,72 @@ def list_attendance(
 #   GET   /analytics/departments/{department}/trend
 #   GET   /admin/explain/{endpoint}
 # --------------------------------------------------------------------------- #
+
+@app.post("/attendance/punch-out", status_code=200)
+def punch_out(body: PunchOutRequest):
+    emp_data = db.employees.find_one({"emp_code": body.emp_code})
+    if not emp_data:
+        raise HTTPException(404, "Employee not found")
+
+    punch_out_utc = (
+        ms_to_utc_dt(body.punched_at)
+        if body.punched_at is not None
+        else utc_truncate_milliseconds(None)
+    )
+
+    entry_open = db.attendance_logs.find_one({
+            "emp_code": body.emp_code,
+            "punch_in": {"$ne": None, "$lte": punch_out_utc},
+        },
+        sort=[("punch_in", DESCENDING)])
+
+    if not entry_open: # extra checking
+        future_entry_close = db.attendance_logs.find_one({
+            "emp_code": body.emp_code, 
+            "punch_in": {"$gt": punch_out_utc}
+        })
+        if future_entry_close:
+            raise HTTPException(422, "punched_at must be after punch_in")
+        raise HTTPException(404, "No matching punch_in record found")
+
+    if entry_open.get("punch_out") is not None: # extra checking
+        future_entry_open = db.attendance_logs.find_one({
+            "emp_code": body.emp_code,
+            "punch_in": {"$gt": punch_out_utc},
+            "punch_out": None,
+        })
+        if future_entry_open:
+            raise HTTPException(422, "punched_at must be after punch_in")
+        raise HTTPException(409, "Record is already punched out")
+
+    punch_in_utc = entry_open["punch_in"]
+    if punch_in_utc.tzinfo is None:
+        punch_in_utc = punch_in_utc.replace(tzinfo=timezone.utc)
+
+    # Ensures punch_out is strictly after punch_in and within 24 hours.
+    elapsed_sec = (punch_out_utc - punch_in_utc).total_seconds()
+    if elapsed_sec <= 0:
+        raise HTTPException(422, "punched_at must be strictly after punch_in")
+    if elapsed_sec > 24 * 60 * 60:
+        raise HTTPException(422, "punched_at cannot be more than 24 hours after punch_in")
+
+    work_hours = compute_work_hours(punch_in_utc, punch_out_utc)
+    overtime_minutes = compute_overtime(punch_out_utc, emp_data["shift_start"], emp_data["shift_end"], entry_open["date"])
+    half_day = work_hours < 4.50
+
+    updated_entry = db.attendance_logs.find_one_and_update({
+        "_id": entry_open["_id"],
+        "punch_out": None
+    },
+    {
+        "$set": {
+            "punch_out": punch_out_utc,
+            "work_hours": work_hours,
+            "overtime_minutes": overtime_minutes,
+            "half_day": half_day,
+        }
+    },
+        return_document=ReturnDocument.AFTER)
+    if not updated_entry:
+        raise HTTPException(409, "Record is already punched out")
+    return updated_entry
