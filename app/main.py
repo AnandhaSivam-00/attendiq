@@ -23,7 +23,7 @@ from pymongo.errors import DuplicateKeyError
 from typing import Annotated, Any, Literal
 from decimal import Decimal, ROUND_HALF_UP
 
-load_dotenv()
+_ = load_dotenv()
 
 client = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017"))
 db = client[os.getenv("MONGO_DB", "attendance_db")].with_options(
@@ -65,6 +65,13 @@ EMAIL_REGEX = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 StatusLiteral = Literal["PRESENT", "ABSENT", "LEAVE", "WFH", "ON_DUTY"]
 PresenceStatusLiteral = Literal["PRESENT", "WFH", "ON_DUTY"]
+ExplainEndpointLiteral = Literal[
+    "attendance_list",
+    "employee_monthly",
+    "department_summary",
+    "late_leaderboard",
+    "department_trend",
+]
 
 Tuple_Year_Month = tuple[int, int]
 EpochMillis = Annotated[int, BeforeValidator(validate_epoch_millis)]
@@ -168,10 +175,126 @@ def compute_working_days_in_month(m_start: dt_date, m_end: dt_date, joined_on_st
 
 # Getting the first and last date of a month from a YYYY-MM string.
 def get_month_start_end(month_str: str):
+    if not month_str or not MONTH_REGEX.match(month_str):
+        raise HTTPException(422, "Invalid month format (YYYY-MM)")
+
     year, month = map(int, month_str.split("-"))
     _, last_day = calendar.monthrange(year, month)
     return month, dt_date(year, month, 1), dt_date(year, month, last_day)
 
+
+
+# Building the query string for retriving the attendance list
+def build_attendance_list_query(
+    emp_code: str | None,
+    date_from: str | None,
+    date_to: str | None,
+    status: str | None,
+):
+    query = {}
+
+    if date_from is not None:
+        parse_date_param(date_from, "date_from")
+    if date_to is not None:
+        parse_date_param(date_to, "date_to")
+    if date_from is not None and date_to is not None and date_from > date_to:
+        raise HTTPException(422, "date_from cannot be after date_to")
+
+    if emp_code is not None:
+        query["emp_code"] = emp_code
+    if date_from is not None or date_to is not None:
+        query["date"] = {}
+        if date_from is not None:
+            query["date"]["$gte"] = date_from
+        if date_to is not None:
+            query["date"]["$lte"] = date_to
+    if status is not None:
+        query["status"] = status
+
+    return query
+
+
+def build_employee_monthly_pipeline(
+    emp_code: str, 
+    month_start: dt_date, 
+    month_end: dt_date, 
+    month: int, 
+    working_days: int
+):
+    return [
+        {
+            "$match": {
+                "emp_code": emp_code,
+                "date": { "$gte": month_start, "$lte": month_end },
+            }
+        },
+        {
+            "$group": {
+                "_id": "$emp_code",
+                "present_days": {
+                    "$sum": {
+                        "$cond": [
+                            {
+                                "$and": [
+                                    {"$in": ["$status", ["PRESENT", "WFH", "ON_DUTY"]]},
+                                    {
+                                        "$lte": [
+                                            {
+                                                "$isoDayOfWeek": {
+                                                    "$dateFromString": {"dateString": "$date", "format": "%Y-%m-%d"}
+                                                }
+                                            },
+                                            5,
+                                        ]
+                                    }
+                                ]
+                            },
+                            {
+                                "$cond": [
+                                    { "$eq": [{"$ifNull": ["$half_day", False]}, True] }, 
+                                    0.5, 
+                                    1.0
+                                ]
+                            },
+                            0.0,
+                        ]
+                    }
+                },
+                "leave_days": {
+                    "$sum": {"$cond": [{"$eq": ["$status", "LEAVE"]}, 1, 0]}
+                },
+                "late_count": {
+                    "$sum": {
+                        "$cond": [
+                            {"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]},
+                            1,
+                            0,
+                        ]
+                    }
+                },
+                "total_late_minutes": {
+                    "$sum": {"$ifNull": ["$late_minutes", 0]}
+                },
+                "total_overtime_minutes": {
+                    "$sum": {"$ifNull": ["$overtime_minutes", 0]}
+                },
+            }
+        },
+        {
+            "$project": {
+                "_id": 0,
+                "emp_code": "$_id",
+                "month": {"$literal": month},
+                "working_days": {"$literal": working_days},
+                "present_days": 1,
+                "leave_days": 1,
+                "late_count": 1,
+                "total_late_minutes": 1,
+                "total_overtime_minutes": 1,
+                "attendance_pct": {"$literal": None},
+            }
+        },
+    ]
 
 # --------------------------------------------------------------------------- #
 # Models with base validation
@@ -326,27 +449,15 @@ def list_attendance(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
 ):
-    q = {}
-    if date_from is not None:
-        parse_date_param(date_from, "date_from")
-    if date_to is not None:
-        parse_date_param(date_to, "date_to")
-    if date_from is not None and date_to is not None and date_from > date_to:
-        raise HTTPException(422, "date_from cannot be after date_to")
-
-    if emp_code is not None:
-        q["emp_code"] = emp_code
-    if date_from is not None or date_to is not None:
-        q["date"] = {}
-        if date_from is not None:
-            q["date"]["$gte"] = date_from
-        if date_to is not None:
-            q["date"]["$lte"] = date_to
-    if status is not None:
-        q["status"] = status
+    query = build_attendance_list_query(
+        emp_code,
+        date_from,
+        date_to,
+        status
+    )
 
     skip = (page - 1) * page_size
-    total = db.attendance_logs.count_documents(q)
+    total = db.attendance_logs.count_documents(query)
     items = (
         db.attendance_logs.find(q, {"_id": 0})
         .sort([("date", DESCENDING), ("emp_code", ASCENDING)])
@@ -583,80 +694,7 @@ def employee_monthly_summary(emp_code: str, month_str: str = Query(..., pattern=
 
     working_days = compute_working_days_in_month(month_start, month_end, emp_data["joined_on"])
 
-    aggregate_pipeline = [
-        {
-            "$match": {
-                "emp_code": emp_code,
-                "date": { "$gte": month_start, "$lte": month_end },
-            }
-        },
-        {
-            "$group": {
-                "_id": "$emp_code",
-                "present_days": {
-                    "$sum": {
-                        "$cond": [
-                            {
-                                "$and": [
-                                    {"$in": ["$status", ["PRESENT", "WFH", "ON_DUTY"]]},
-                                    {
-                                        "$lte": [
-                                            {
-                                                "$isoDayOfWeek": {
-                                                    "$dateFromString": {"dateString": "$date", "format": "%Y-%m-%d"}
-                                                }
-                                            },
-                                            5,
-                                        ]
-                                    }
-                                ]
-                            },
-                            {
-                                "$cond": [
-                                    { "$eq": [{"$ifNull": ["$half_day", False]}, True] }, 
-                                    0.5, 
-                                    1.0
-                                ]
-                            },
-                            0.0,
-                        ]
-                    }
-                },
-                "leave_days": {
-                    "$sum": {"$cond": [{"$eq": ["$status", "LEAVE"]}, 1, 0]}
-                },
-                "late_count": {
-                    "$sum": {
-                        "$cond": [
-                            {"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]},
-                            1,
-                            0,
-                        ]
-                    }
-                },
-                "total_late_minutes": {
-                    "$sum": {"$ifNull": ["$late_minutes", 0]}
-                },
-                "total_overtime_minutes": {
-                    "$sum": {"$ifNull": ["$overtime_minutes", 0]}
-                },
-            }
-        },
-        {
-            "$project": {
-                "_id": 0,
-                "emp_code": "$_id",
-                "month": {"$literal": month},
-                "working_days": {"$literal": working_days},
-                "present_days": 1,
-                "leave_days": 1,
-                "late_count": 1,
-                "total_late_minutes": 1,
-                "total_overtime_minutes": 1,
-                "attendance_pct": {"$literal": None},
-            }
-        },
-    ]
+    aggregate_pipeline = build_employee_monthly_pipeline(emp_code, month_start, month_end, month, working_days)
 
     results = list(db.attendance_logs.aggregate(aggregate_pipeline))
 
@@ -914,3 +952,54 @@ def late_leaderboard(
         "month": month_str,
         "items": items
     }
+
+
+@app.get("/admin/explain/{endpoint}")
+def explain_endpoint(
+    endpoint: ExplainEndpointLiteral = Path(...),
+    emp_code: str | None = None,
+    month: str | None = Query(None, pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
+    department: str | None = None,
+    limit: int = Query(10, ge=1, le=50),
+    date_from: str | None = None,
+    date_to: str | None = None,
+    status:StatusLiteral | None = None,
+    from_: str | None = Query(None, alias="from"),
+    to: str | None = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+):
+    if endpoint == "attendance_list":
+        query = build_attendance_list_query(emp_code, date_from, date_to, status)
+        collection_name = "attendance_logs"
+        cmd = {
+            "explain": {
+                "find": collection_name,
+                "filter": query,
+                "sort": {"date": -1, "emp_code": 1},
+                "projection": {"_id": 0},
+                "skip": (page - 1) * page_size,
+                "limit": page_size,
+            },
+            "verbosity": "executionStats",
+        }
+    elif endpoint == "employee_monthly":
+        if not emp_code or not month:
+            raise HTTPException(422, "emp_code and month are required for employee_monthly")
+
+        emp_data = db.employees.find_one({"emp_code": emp_code})
+        joined_on = emp_data["joined_on"] if emp_data else f"{month}-01"
+        month_int, month_start, month_end = get_month_start_end(month)
+
+        working_days = compute_working_days_in_month(month_start, month_end, joined_on)
+        aggregate_pipeline = build_employee_monthly_pipeline(emp_code, month_start, month_end, month_int, working_days)
+
+        collection_name = "attendance_logs"
+        cmd = {
+            "explain": {
+                "aggregate": collection_name,
+                "pipeline": aggregate_pipeline,
+                "cursor": {},
+            },
+            "verbosity": "executionStats",
+        }
