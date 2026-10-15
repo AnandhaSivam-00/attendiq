@@ -8,6 +8,7 @@ This file was written quickly by a colleague who has left the company. The happy
 works, but nobody has reviewed it. Read PROBLEM_STATEMENT.docx for what is expected of you,
 openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
+from math import dist
 import os
 import re
 import calendar
@@ -165,25 +166,11 @@ def compute_working_days_in_month(m_start: dt_date, m_end: dt_date, joined_on_st
         curr += timedelta(days=1)
     return count
 
-# Build a MongoDB aggregation expression that rounds a non-negative number
-# half-up using Decimal128 arithmetic: floor(val * 10^k + 0.5) / 10^k.
-def mongo_round_half_up(decimal_expr: Any, decimals: int):
-    factor = 10**decimals
-    return {
-        "$toDouble": {
-            "$divide": [
-                {
-                    "$floor": {
-                        "$add": [
-                            {"$multiply": [{"$toDecimal": decimal_expr}, factor]},
-                            Decimal128("0.5"),
-                        ]
-                    }
-                },
-                factor,
-            ]
-        }
-    }
+# Getting the first and last date of a month from a YYYY-MM string.
+def get_month_start_end(month_str: str):
+    year, month = map(int, month_str.split("-"))
+    _, last_day = calendar.monthrange(year, month)
+    return month, dt_date(year, month, 1), dt_date(year, month, last_day)
 
 
 # --------------------------------------------------------------------------- #
@@ -585,3 +572,110 @@ def patch_attendance(emp_code: str, date: str, body: RegularizeRequest):
         raise HTTPException(409, "Concurrent modification detected; please retry")
 
     return updated_entry
+
+@app.get("/analytics/employees/{emp_code}/monthly")
+def employee_monthly_summary(emp_code: str, month_str: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$")):
+    emp_data = db.employees.find_one({"emp_code": emp_code})
+    if not emp_data:
+        raise HTTPException(404, "Employee not found")
+
+    month, month_start, month_end = get_month_start_end(month_str)
+
+    working_days = compute_working_days_in_month(month_start, month_end, emp_data["joined_on"])
+
+    aggregate_pipeline = [
+        {
+            "$match": {
+                "emp_code": emp_code,
+                "date": { "$gte": month_start, "$lte": month_end },
+            }
+        },
+        {
+            "$group": {
+                "_id": "$emp_code",
+                "present_days": {
+                    "$sum": {
+                        "$cond": [
+                            {
+                                "$and": [
+                                    {"$in": ["$status", ["PRESENT", "WFH", "ON_DUTY"]]},
+                                    {
+                                        "$lte": [
+                                            {
+                                                "$isoDayOfWeek": {
+                                                    "$dateFromString": {"dateString": "$date", "format": "%Y-%m-%d"}
+                                                }
+                                            },
+                                            5,
+                                        ]
+                                    }
+                                ]
+                            },
+                            {
+                                "$cond": [
+                                    { "$eq": [{"$ifNull": ["$half_day", False]}, True] }, 
+                                    0.5, 
+                                    1.0
+                                ]
+                            },
+                            0.0,
+                        ]
+                    }
+                },
+                "leave_days": {
+                    "$sum": {"$cond": [{"$eq": ["$status", "LEAVE"]}, 1, 0]}
+                },
+                "late_count": {
+                    "$sum": {
+                        "$cond": [
+                            {"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]},
+                            1,
+                            0,
+                        ]
+                    }
+                },
+                "total_late_minutes": {
+                    "$sum": {"$ifNull": ["$late_minutes", 0]}
+                },
+                "total_overtime_minutes": {
+                    "$sum": {"$ifNull": ["$overtime_minutes", 0]}
+                },
+            }
+        },
+        {
+            "$project": {
+                "_id": 0,
+                "emp_code": "$_id",
+                "month": {"$literal": month},
+                "working_days": {"$literal": working_days},
+                "present_days": 1,
+                "leave_days": 1,
+                "late_count": 1,
+                "total_late_minutes": 1,
+                "total_overtime_minutes": 1,
+                "attendance_pct": {"$literal": None},
+            }
+        },
+    ]
+
+    results = list(db.attendance_logs.aggregate(aggregate_pipeline))
+
+    if not results:
+        return {
+            "emp_code": emp_code,
+            "month": month,
+            "working_days": working_days,
+            "present_days": 0,
+            "leave_days": 0,
+            "late_count": 0,
+            "total_late_minutes": 0,
+            "total_overtime_minutes": 0,
+            "attendance_pct": 0.0 if working_days > 0 else None,
+        }
+
+    result = results[0]
+    if working_days > 0:
+        result["attendance_pct"] = round_half_up(result["present_days"] / working_days * 100, 2)
+    else:
+        result["attendance_pct"] = None
+    return result
